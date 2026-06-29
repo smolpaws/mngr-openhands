@@ -26,8 +26,9 @@ snapshot / clone` workflow drives OpenHands too.
 ```bash
 pip install imbue-mngr
 pip install mngr-openhands        # (or: pip install -e . from a checkout)
-# and have the OpenHands CLI available on PATH:
-pip install openhands-ai         # provides the `openhands` command
+# and have the OpenHands CLI on PATH (the V1 agent-sdk CLI):
+uv tool install openhands        # recommended; provides the `openhands` command
+# or: pip install openhands
 ```
 
 Verify:

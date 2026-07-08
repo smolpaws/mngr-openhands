@@ -79,6 +79,9 @@ AGENT_WORK_DIR_ENV_VAR = "MNGR_AGENT_WORK_DIR"
 OPENHANDS_STATE_SUBDIR = "openhands"
 CONVERSATIONS_SUBDIR = "conversations"
 
+# The user's shared OpenHands home dir (where a normal `openhands` login lives).
+SHARED_OPENHANDS_DIRNAME = ".openhands"
+
 # The file OpenHands writes its settings + LLM credentials into.
 AGENT_SETTINGS_FILENAME = "agent_settings.json"
 
@@ -147,19 +150,19 @@ class OpenHandsAgent(
     ) -> CommandString:
         """Assemble the ``openhands`` command, injecting unattended flags.
 
-        Unattended flags go right after the base command (before user
-        ``cli_args`` / post-``--`` args) so an explicit user override still wins
-        by appearing later on the line.
+        The unattended flags are appended to the *base command* (the override if
+        given, else ``agent_config.command``) before delegating to the parent's
+        assembly. That places them right after the base — before user
+        ``cli_args`` / post-``--`` args, so an explicit user override still wins
+        by appearing later — while letting the parent handle multi-word base
+        commands (e.g. ``poetry run openhands``) and arg quoting correctly.
         """
-        base = super().assemble_command(host, agent_args, command_override, initial_message)
         extra = self.get_unattended_cli_args()
-        if not extra:
-            return base
-        parts = str(base).split(" ", 1)
-        head = parts[0]
-        rest = parts[1] if len(parts) > 1 else ""
-        assembled = " ".join([head, *extra] + ([rest] if rest else []))
-        return CommandString(assembled)
+        if extra:
+            base_cmd = command_override or self.agent_config.command
+            if base_cmd:
+                command_override = CommandString(f"{base_cmd} {' '.join(extra)}")
+        return super().assemble_command(host, agent_args, command_override, initial_message)
 
     def modify_env_vars(self, host: OnlineHostInterface, env_vars: dict[str, str]) -> None:
         """Point OpenHands' state dirs at this agent's mngr state dir.
@@ -213,13 +216,39 @@ class OpenHandsAgent(
 
     def _link_shared_login(self, host: OnlineHostInterface, persistence_dir: Path) -> None:
         """Symlink the per-agent ``agent_settings.json`` to the user's shared one
-        so a single login/LLM config authenticates every agent."""
-        shared = Path(os.path.expanduser("~/.openhands")) / AGENT_SETTINGS_FILENAME
+        so a single login/LLM config authenticates every agent.
+
+        The shared path must resolve on *the host the agent runs on*, which may
+        be remote — so the home dir is queried from the host itself, never from
+        the local machine's ``~``.
+        """
+        shared = self._host_home(host) / SHARED_OPENHANDS_DIRNAME / AGENT_SETTINGS_FILENAME
         if not host.path_exists(shared):
             logger.info("openhands: no shared {} found; agent starts with its own config", shared)
             return
         link = persistence_dir / AGENT_SETTINGS_FILENAME
         symlink_on_host(host, source=shared, dest=link, ensure_source_parent=False)
+
+    @staticmethod
+    def _host_home(host: OnlineHostInterface) -> Path:
+        """Resolve the home directory *on ``host``* (which may be remote).
+
+        Asks the host for ``$HOME`` directly so the shared-login path is correct
+        on remote hosts (SSH/Docker/Modal), where the local machine's home dir
+        (e.g. ``/Users/x``) does not exist. Falls back to the mngr state dir's
+        parent, then the local home — best-effort, never raising.
+        """
+        try:
+            result = host.execute_idempotent_command('printf %s "$HOME"')
+            home = result.stdout.strip()
+            if home:
+                return Path(home)
+        except Exception as error:  # pragma: no cover - defensive
+            logger.warning("openhands: could not resolve $HOME on host: {}", error)
+        try:
+            return Path(host.host_dir).parent
+        except Exception:  # pragma: no cover - defensive
+            return Path(os.path.expanduser("~"))
 
 
 @hookimpl

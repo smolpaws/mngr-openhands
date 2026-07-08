@@ -5,6 +5,8 @@ per-agent isolation env mapping, and the unattended command assembly. The
 live end-to-end behavior is covered separately in ``test_real_world.py``.
 """
 
+from types import SimpleNamespace
+
 from imbue.mngr.agents.tui_agent import InteractiveTuiAgent
 
 from imbue.mngr_openhands import plugin
@@ -130,3 +132,76 @@ def test_assemble_command_attended_is_bare():
     agent = _agent(unattended=False)
     cmd = str(agent.assemble_command(host=None, agent_args=(), command_override=None))
     assert cmd == "openhands"
+
+
+def test_assemble_command_handles_multi_word_base():
+    # A multi-word base command (e.g. a launcher) must keep the flag attached to
+    # the openhands invocation, not wedged between the launcher's words.
+    agent = _agent(command="poetry run openhands")
+    cmd = str(agent.assemble_command(host=None, agent_args=("-t", "do X"), command_override=None))
+    assert cmd == "poetry run openhands --always-approve -t 'do X'"
+
+
+def test_assemble_command_override_wins_and_keeps_flag():
+    # An explicit command_override replaces the base; the unattended flag still
+    # lands right after it.
+    agent = _agent()
+    cmd = str(
+        agent.assemble_command(
+            host=None,
+            agent_args=(),
+            command_override=plugin.CommandString("uv run openhands"),
+        )
+    )
+    assert cmd == "uv run openhands --always-approve"
+
+
+# ── Shared-login home resolution (remote-safe) ───────────────────────────
+
+
+class _FakeHost:
+    """Minimal host stand-in for the shared-login boundary.
+
+    A test double for the external *host* (which may be remote), not for the
+    code under test: it records the symlink command and reports a home dir that
+    differs from the local machine's, so we prove ``_host_home`` asks the host
+    rather than resolving ``~`` locally.
+    """
+
+    def __init__(self, home: str, existing_paths: set[str]):
+        self._home = home
+        self._existing = existing_paths
+        self.commands: list[str] = []
+        self.host_dir = plugin.Path(f"{home}/.mngr")
+
+    def execute_idempotent_command(self, command, **kwargs):
+        self.commands.append(command)
+        return SimpleNamespace(stdout=self._home, stderr="", success=True)
+
+    def path_exists(self, path) -> bool:
+        return str(path) in self._existing
+
+
+def test_host_home_resolves_from_host_not_local():
+    host = _FakeHost(home="/home/remoteuser", existing_paths=set())
+    home = plugin.OpenHandsAgent._host_home(host)
+    assert home == plugin.Path("/home/remoteuser")
+
+
+def test_shared_login_links_against_host_home():
+    home = "/home/remoteuser"
+    shared = f"{home}/.openhands/agent_settings.json"
+    host = _FakeHost(home=home, existing_paths={shared})
+    agent = _agent()
+    agent._link_shared_login(host, plugin.Path(f"{home}/.mngr/agents/a1/openhands"))
+    # The symlink command must target the host-resolved shared settings path.
+    link_cmds = [c for c in host.commands if "ln -sfn" in c]
+    assert link_cmds, "expected a symlink command"
+    assert shared in link_cmds[0]
+
+
+def test_shared_login_skips_when_no_shared_settings():
+    host = _FakeHost(home="/home/remoteuser", existing_paths=set())
+    agent = _agent()
+    agent._link_shared_login(host, plugin.Path("/home/remoteuser/.mngr/agents/a1/openhands"))
+    assert not [c for c in host.commands if "ln -sfn" in c]

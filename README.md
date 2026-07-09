@@ -45,7 +45,7 @@ OpenHands ships a Textual TUI, so the plugin drives it as an
 `mngr message` pastes into the TUI and submits with Enter. Readiness is detected
 from a stable banner in the TUI.
 
-Three behaviors make OpenHands usable under orchestration, all on by default and
+These behaviors make OpenHands usable under orchestration, all on by default and
 each toggleable via config:
 
 - **Per-agent isolation** (`isolate_state`) — OpenHands resolves all of its
@@ -63,6 +63,14 @@ each toggleable via config:
   confirmation and would block forever with no TTY driver, so unattended mode
   appends `--always-approve` and the agent runs to completion. Turn it off to
   keep the interactive approval flow (drive approvals via `mngr connect`).
+- **Session preserve / adopt** — conversations are portable across the agent
+  lifecycle. On destroy, the agent's conversations are copied to mngr's
+  `preserved/` area (`preserve_on_destroy`, on by default) so they survive. A
+  fresh agent can resume one with `mngr create … --adopt <conversation-id>`
+  (copies it into the new agent and relaunches with `--resume`), or carry the
+  source agent's latest conversation forward when cloning with `--from <agent>`.
+  No cwd rebinding is needed — a resumed conversation takes its working dir from
+  the per-agent `OPENHANDS_WORK_DIR`.
 
 ### Verified (local, mngr 0.2.17, openhands 1.13.1)
 - `mngr plugin list` shows the plugin, enabled.
@@ -70,7 +78,9 @@ each toggleable via config:
 - End-to-end (`tests/test_real_world.py`): `mngr create` launches a real
   OpenHands agent that uses the shared login, runs unattended, edits a file in
   its own git worktree, and persists its conversation under the isolated
-  per-agent state dir (not `~/.openhands`).
+  per-agent state dir (not `~/.openhands`). A second test destroys an agent,
+  confirms its conversation is preserved, then adopts it into a fresh agent that
+  relaunches with `--resume`.
 
 ## Roadmap
 
@@ -85,8 +95,6 @@ that could come next:
    handling). OpenHands' confirmation mode is the hook point.
 3. **Headless / ACP option** — optionally drive `openhands acp` or `--headless`
    for non-TTY orchestration instead of the TUI.
-4. **Session adopt/preserve** — map OpenHands conversation ids to mngr's
-   adopt/preserve on create/destroy.
 
 ## Zero-code alternative
 

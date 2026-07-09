@@ -154,7 +154,7 @@ def test_mngr_runs_isolated_shared_login_openhands_agent(git_repo: Path):
 
         # Isolation: the conversation persisted under the agent's own mngr state
         # dir, NOT the user's ~/.openhands.
-        state_dir = _resolve_agent_state_dir(agent_name)
+        state_dir = _resolve_agent_state_dir(git_repo, agent_name)
         assert state_dir is not None, "could not resolve agent mngr state dir"
         conversations = state_dir / "openhands" / "conversations"
         assert conversations.is_dir(), (
@@ -186,16 +186,26 @@ def _resolve_worktree(repo: Path, agent_name: str) -> Path | None:
     return None
 
 
-def _resolve_agent_state_dir(agent_name: str) -> Path | None:
-    """Find the agent's mngr state dir via its isolated persistence subdir."""
-    mngr_home = Path(os.environ.get("MNGR_HOME", Path.home() / ".mngr"))
-    if not mngr_home.exists():
+def _resolve_agent_state_dir(repo: Path, agent_name: str) -> Path | None:
+    """Resolve *this* agent's mngr state dir (``<mngr_home>/agents/<id>``).
+
+    mngr keys the state dir by the agent's generated id, not its name, so we ask
+    mngr for the id of the agent we created (matched by name) and build the path
+    from that — never by scanning for the first ``openhands`` dir, which could
+    match an unrelated agent and turn the isolation check into a false positive.
+    """
+    # Parse stdout regardless of exit code: mngr may return non-zero if an
+    # unrelated provider (e.g. Docker) is unreachable while still listing the
+    # local agents we care about on stdout.
+    result = _run(["mngr", "list", "--fields", "id,name"], cwd=repo)
+    agent_id = None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == agent_name and parts[0].startswith("agent-"):
+            agent_id = parts[0]
+            break
+    if agent_id is None:
         return None
-    for conversations in mngr_home.rglob("openhands/conversations"):
-        state_dir = conversations.parent.parent
-        if agent_name in str(state_dir):
-            return state_dir
-    # Fall back to the first match if the name isn't encoded in the path.
-    for conversations in mngr_home.rglob("openhands/conversations"):
-        return conversations.parent.parent
-    return None
+    mngr_home = Path(os.environ.get("MNGR_HOME", Path.home() / ".mngr"))
+    state_dir = mngr_home / "agents" / agent_id
+    return state_dir if state_dir.exists() else None

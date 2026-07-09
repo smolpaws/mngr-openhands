@@ -89,10 +89,8 @@ def test_isolation_env_points_openhands_dirs_under_agent_state_dir():
 def test_isolation_disabled_leaves_env_untouched():
     agent = _agent(isolate_state=False)
     env = {"MNGR_AGENT_STATE_DIR": "/host/state/agent-1"}
-    agent.modify_env_vars(host=None, env_vars=dict(env))
-    after = {"MNGR_AGENT_STATE_DIR": "/host/state/agent-1"}
-    agent.modify_env_vars(host=None, env_vars=after)
-    assert "OPENHANDS_PERSISTENCE_DIR" not in after
+    agent.modify_env_vars(host=None, env_vars=env)
+    assert "OPENHANDS_PERSISTENCE_DIR" not in env
 
 
 def test_isolation_noop_without_agent_state_dir():

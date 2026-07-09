@@ -37,25 +37,44 @@ Verify:
 mngr plugin list                 # 'openhands' should appear, ENABLED
 ```
 
-## Status — MVP
+## How it works
 
-This is a minimal but working plugin. It registers the `openhands` agent type
-(and `oh` alias) by reusing mngr's `SendKeysAgent` behavior: the `openhands` CLI
-runs in the agent's tmux pane, `mngr connect` attaches, `mngr message` types into
-it. It defaults the base command to `openhands` and appends any args after `--`.
+OpenHands ships a Textual TUI, so the plugin drives it as an
+`InteractiveTuiAgent` (like the built-in `codex` / `claude` plugins): the
+`openhands` CLI runs in the agent's tmux pane, `mngr connect` attaches, and
+`mngr message` pastes into the TUI and submits with Enter. Readiness is detected
+from a stable banner in the TUI.
 
-It does **not** yet implement the deeper integrations that the production
-`mngr_claude` / `mngr_opencode` plugins have. Those are the roadmap.
+Three behaviors make OpenHands usable under orchestration, all on by default and
+each toggleable via config:
+
+- **Per-agent isolation** (`isolate_state`) — OpenHands resolves all of its
+  state (settings, credentials, stored conversations) from
+  `OPENHANDS_PERSISTENCE_DIR` (default `~/.openhands`). The plugin points each
+  agent at its own persistence dir under the agent's mngr state dir — injected
+  only on the openhands process — so parallel agents don't collide and your real
+  `~/.openhands` is left untouched. This mirrors `mngr_codex`'s per-agent
+  `CODEX_HOME`.
+- **Shared login** (`share_login`) — so you don't have to re-authenticate every
+  agent, the per-agent `agent_settings.json` is symlinked to your shared
+  `~/.openhands/agent_settings.json`. One login authenticates every agent. Opt
+  out to give each agent its own config.
+- **Unattended** (`unattended`) — a bare `openhands` defaults to *always-ask*
+  confirmation and would block forever with no TTY driver, so unattended mode
+  appends `--always-approve` and the agent runs to completion. Turn it off to
+  keep the interactive approval flow (drive approvals via `mngr connect`).
 
 ### Verified (local, mngr 0.2.17, openhands 1.13.1)
 - `mngr plugin list` shows the plugin, enabled.
 - `mngr create <name> openhands` and the `oh` alias create and start agents.
-- An mngr-managed agent successfully executed the OpenHands CLI
-  (`OpenHands CLI 1.13.1`).
+- End-to-end (`tests/test_real_world.py`): `mngr create` launches a real
+  OpenHands agent that uses the shared login, runs unattended, edits a file in
+  its own git worktree, and persists its conversation under the isolated
+  per-agent state dir (not `~/.openhands`).
 
 ## Roadmap (toward parity with mngr_claude / mngr_opencode)
 
-To make OpenHands a *first-class citizen* rather than a thin command wrapper:
+Remaining to make OpenHands a full first-class citizen:
 
 1. **Common transcript** — convert OpenHands' event stream into mngr's transcript
    format so `mngr transcript` works (OpenHands has structured events / `--json`
@@ -63,11 +82,9 @@ To make OpenHands a *first-class citizen* rather than a thin command wrapper:
 2. **Lifecycle markers** — RUNNING vs WAITING detection, including flipping to
    WAITING on OpenHands' confirmation prompts (cf. mngr_opencode permission
    handling). OpenHands' confirmation mode is the hook point.
-3. **Per-agent isolation** — scope OpenHands config/creds/state per agent
-   (`~/.openhands/` today) so parallel agents don't collide.
-4. **Headless / ACP option** — optionally drive `openhands acp` or `--headless`
+3. **Headless / ACP option** — optionally drive `openhands acp` or `--headless`
    for non-TTY orchestration instead of the TUI.
-5. **Session adopt/preserve** — map OpenHands conversation ids to mngr's
+4. **Session adopt/preserve** — map OpenHands conversation ids to mngr's
    adopt/preserve on create/destroy.
 
 ## Zero-code alternative

@@ -170,7 +170,92 @@ def test_mngr_runs_isolated_shared_login_openhands_agent(git_repo: Path):
             f"expected shared-login symlink at {settings_link}"
         )
     finally:
-        _run(["mngr", "destroy", agent_name, "--yes"], cwd=git_repo, timeout=60)
+        _run(["mngr", "destroy", agent_name, "-f"], cwd=git_repo, timeout=60)
+
+
+def test_preserve_then_adopt_carries_conversation_forward(git_repo: Path):
+    """End-to-end: an agent's conversation is preserved on destroy, then adopted
+    into a fresh agent, which relaunches with ``--resume`` against it."""
+    agent_a = f"ohsrc{uuid.uuid4().hex[:8]}"
+    sentinel = f"adopt-{uuid.uuid4().hex[:6]}"
+    task = (
+        f"Create a file named result.txt in the current directory containing "
+        f"exactly the text '{sentinel}', then finish."
+    )
+
+    create = _run(
+        ["mngr", "create", agent_a, "openhands", "--no-connect", "--yes", "--", "-t", task],
+        cwd=git_repo,
+        timeout=120,
+    )
+    assert create.returncode == 0, (
+        f"mngr create failed:\nSTDOUT:{create.stdout}\nSTDERR:{create.stderr}"
+    )
+
+    conversation_id = None
+    try:
+        # Wait for a conversation to be persisted under agent A's isolated store.
+        state_dir = None
+        deadline = time.time() + RUN_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            if state_dir is None:
+                state_dir = _resolve_agent_state_dir(git_repo, agent_a)
+            if state_dir is not None:
+                conversations = state_dir / "openhands" / "conversations"
+                ids = [p.name for p in conversations.iterdir()] if conversations.is_dir() else []
+                if ids:
+                    conversation_id = ids[0]
+                    break
+            time.sleep(5)
+        assert conversation_id is not None, "agent A never persisted a conversation"
+    finally:
+        # Destroy A with preservation on (the default) so its conversation survives.
+        _run(["mngr", "destroy", agent_a, "-f"], cwd=git_repo, timeout=60)
+
+    # The conversation must now live under mngr's preserved/ area.
+    preserved = _find_preserved_conversation(conversation_id)
+    assert preserved is not None, (
+        f"conversation {conversation_id} was not preserved after destroy"
+    )
+
+    # Adopt it into a fresh agent B.
+    agent_b = f"ohdst{uuid.uuid4().hex[:8]}"
+    create_b = _run(
+        [
+            "mngr", "create", agent_b, "openhands",
+            "--no-connect", "--yes", "--adopt", conversation_id,
+        ],
+        cwd=git_repo,
+        timeout=120,
+    )
+    assert create_b.returncode == 0, (
+        f"mngr create --adopt failed:\nSTDOUT:{create_b.stdout}\nSTDERR:{create_b.stderr}"
+    )
+    try:
+        state_b = _resolve_agent_state_dir(git_repo, agent_b)
+        assert state_b is not None, "could not resolve agent B state dir"
+        # The adopted conversation was copied into B's isolated store...
+        adopted = state_b / "openhands" / "conversations" / conversation_id
+        assert adopted.is_dir(), f"adopted conversation not copied into {adopted}"
+        # ...and B recorded a resume pointer to it.
+        pointer = state_b / "openhands_resume_conversation"
+        assert pointer.is_file() and pointer.read_text().strip() == conversation_id, (
+            f"expected resume pointer for {conversation_id} at {pointer}"
+        )
+    finally:
+        _run(["mngr", "destroy", agent_b, "-f"], cwd=git_repo, timeout=60)
+
+
+def _find_preserved_conversation(conversation_id: str) -> Path | None:
+    """Locate a preserved conversation dir by id under mngr's preserved/ area."""
+    mngr_home = Path(os.environ.get("MNGR_HOME", Path.home() / ".mngr"))
+    preserved_root = mngr_home / "preserved"
+    if not preserved_root.is_dir():
+        return None
+    for candidate in preserved_root.rglob(f"conversations/{conversation_id}"):
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 def _resolve_worktree(repo: Path, agent_name: str) -> Path | None:

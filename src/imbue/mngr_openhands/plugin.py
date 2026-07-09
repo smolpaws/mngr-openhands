@@ -39,8 +39,27 @@ block forever with no TTY driver. When unattended (the default for
 orchestration), this appends ``--always-approve`` so the agent runs to
 completion. Attended agents keep the interactive confirmation flow.
 
-Still on the roadmap (see README): common-transcript conversion, lifecycle
-RUNNING/WAITING detection from confirmation prompts, and session adopt/preserve.
+Session preserve/adopt (conversation portability)
+-------------------------------------------------
+OpenHands stores each conversation as a directory under
+``OPENHANDS_CONVERSATIONS_DIR`` (``<persistence_dir>/conversations/<id>``), and
+the ``openhands`` CLI resumes one with ``--resume <id>`` / ``--last``. Because a
+resumed conversation takes its working dir from ``OPENHANDS_WORK_DIR`` (which
+this plugin already injects) rather than from the stored state, no cwd rebinding
+is needed — unlike codex.
+
+- **Preserve** (``preserve_on_destroy``): on destroy, the agent's whole
+  ``conversations`` tree is copied to mngr's ``preserved/`` area before the
+  state dir is removed, so the conversation survives the agent.
+- **Adopt** (``--adopt <id>`` / ``--from <agent>``): a freshly created agent can
+  resume an existing conversation. The named conversation dir is copied into the
+  new agent's isolated store and ``--resume <id>`` is appended to its launch
+  command. ``--adopt`` names a conversation explicitly (an unknown id is an
+  error); ``--from`` carries the source agent's latest conversation forward as a
+  bonus (a source with none just starts fresh).
+
+Still on the roadmap (see README): common-transcript conversion and lifecycle
+RUNNING/WAITING detection from confirmation prompts.
 """
 
 from __future__ import annotations
@@ -56,14 +75,35 @@ from pydantic import Field
 from imbue.mngr import hookimpl
 from imbue.mngr.agents.tui_agent import InteractiveTuiAgent
 from imbue.mngr.agents.tui_utils import send_enter_best_effort
+from imbue.mngr.api.preservation import PreservedItem
+from imbue.mngr.api.preservation import adopt_sessions
+from imbue.mngr.api.preservation import dedupe_by_resolved_path
+from imbue.mngr.api.preservation import flag_gated_items
+from imbue.mngr.api.preservation import iter_agent_session_paths
+from imbue.mngr.api.preservation import preserve_agent_state
+from imbue.mngr.api.preservation import preserve_host_agents_on_destroy
+from imbue.mngr.api.preservation import require_unique_match
+from imbue.mngr.api.preservation import run_adopt_session_preflight
+from imbue.mngr.api.preservation import transfer_cloned_agent_session_store
 from imbue.mngr.config.data_types import AgentTypeConfig
 from imbue.mngr.config.data_types import CommandString
+from imbue.mngr.config.data_types import MngrContext
 from imbue.mngr.hosts.common import get_agent_state_dir_path
 from imbue.mngr.hosts.common import symlink_on_host
 from imbue.mngr.hosts.tmux import TmuxWindowTarget
 from imbue.mngr.interfaces.agent import AgentInterface
+from imbue.mngr.interfaces.agent import HasSessionAdoptionMixin
+from imbue.mngr.interfaces.agent import HasSessionPreservationMixin
 from imbue.mngr.interfaces.agent import HasUnattendedModeMixin
+from imbue.mngr.interfaces.data_types import FileType
+from imbue.mngr.interfaces.host import CreateAgentOptions
+from imbue.mngr.interfaces.host import HostInterface
+from imbue.mngr.interfaces.host import HostLocation
 from imbue.mngr.interfaces.host import OnlineHostInterface
+from imbue.mngr.plugins.hookspecs import OnBeforeCreateArgs
+from imbue.mngr.primitives import AgentTypeName
+from imbue.mngr.primitives import DiscoveredAgent
+from imbue.mngr.errors import UserInputError
 
 # OpenHands CLI env vars (openhands_cli/locations.py) — the per-agent isolation
 # lever. Values default to ~/.openhands; overriding them relocates all state.
@@ -87,6 +127,22 @@ AGENT_SETTINGS_FILENAME = "agent_settings.json"
 
 # Auto-approve flag for unattended runs (a bare TUI defaults to always-ask).
 ALWAYS_APPROVE_FLAG = "--always-approve"
+
+# Resume an existing conversation (openhands_cli/entrypoint.py: --resume <id>).
+RESUME_FLAG = "--resume"
+
+# Conversations live at ``<state_subdir>/conversations`` under the agent state
+# dir; this relpath addresses that store for preserve + adopt (mirrors codex's
+# ``sessions`` relpath).
+CONVERSATIONS_RELPATH = os.path.join(OPENHANDS_STATE_SUBDIR, CONVERSATIONS_SUBDIR)
+
+# Stable event-source name for this agent type (preserve/transcript convention).
+OPENHANDS_EVENT_SOURCE = "openhands"
+
+# Per-agent file recording the conversation id to resume, written by
+# ``adopt_session`` and read by ``assemble_command`` (analog of codex's
+# ``codex_root_session``). Lives directly under the agent state dir.
+RESUME_POINTER_FILENAME = "openhands_resume_conversation"
 
 
 class OpenHandsAgentConfig(AgentTypeConfig):
@@ -114,11 +170,18 @@ class OpenHandsAgentConfig(AgentTypeConfig):
         "to the user's ~/.openhands/agent_settings.json so one login/LLM config "
         "authenticates every agent. Ignored when isolate_state is False.",
     )
+    preserve_on_destroy: bool = Field(
+        default=True,
+        description="When destroying this agent, first copy its OpenHands conversations "
+        "to <local_host_dir>/preserved/ so they survive. Set to False to discard them.",
+    )
 
 
 class OpenHandsAgent(
     InteractiveTuiAgent[OpenHandsAgentConfig],
     HasUnattendedModeMixin,
+    HasSessionPreservationMixin,
+    HasSessionAdoptionMixin,
 ):
     """OpenHands agent type — drives the ``openhands`` TUI in a tmux pane."""
 
@@ -162,7 +225,141 @@ class OpenHandsAgent(
             base_cmd = command_override or self.agent_config.command
             if base_cmd:
                 command_override = CommandString(f"{base_cmd} {' '.join(extra)}")
-        return super().assemble_command(host, agent_args, command_override, initial_message)
+        base = super().assemble_command(host, agent_args, command_override, initial_message)
+        return self._wrap_with_resume_prelude(host, base)
+
+    def _host_agent_dir(self, host: OnlineHostInterface) -> Path:
+        """The agent's state dir *on ``host``* (which may be remote).
+
+        Resolves against the passed host rather than ``self.host`` so the
+        adopt/preserve/resume paths address files on the host the agent actually
+        runs on. Falls back to ``_get_agent_dir()`` (which resolves against
+        ``self.host.host_dir`` — the same value for the bound agent).
+        """
+        return self._resolve_agent_state_dir(host) or self._get_agent_dir()
+
+    def _wrap_with_resume_prelude(self, host: OnlineHostInterface, base: CommandString) -> CommandString:
+        """Append ``--resume <id>`` when an adopted conversation is pending.
+
+        ``adopt_session`` runs in ``on_after_provisioning`` — *after*
+        ``assemble_command`` — so the resume id is not known when the command is
+        built. Like codex, the id is therefore read at launch from a per-agent
+        pointer file (shell-evaluated, since the stored command is replayed on
+        every ``mngr start``). ``set --`` appends ``--resume <id>`` without
+        unquoted word-splitting, and an empty/absent pointer leaves ``"$@"``
+        empty (a plain, unresumed launch). No-op unless state is isolated (the
+        pointer lives under the isolated state dir).
+        """
+        if not self.agent_config.isolate_state:
+            return base
+        quoted_pointer = shlex.quote(str(self._host_agent_dir(host) / RESUME_POINTER_FILENAME))
+        resume_prelude = (
+            f'__oh_cid="$(cat {quoted_pointer} 2>/dev/null || true)"; set --; '
+            f'if [ -n "$__oh_cid" ]; then set -- {RESUME_FLAG} "$__oh_cid"; fi'
+        )
+        return CommandString(f'{{ {resume_prelude}; {base} "$@"; }}')
+
+    # ── session preserve / adopt ─────────────────────────────────────────
+
+    def on_destroy(self, host: OnlineHostInterface) -> None:
+        """Preserve the agent's conversations before its state dir is deleted."""
+        if self.agent_config.preserve_on_destroy:
+            self.preserve_session_state(host)
+
+    def preserve_session_state(self, host: OnlineHostInterface) -> None:
+        preserve_agent_state(_openhands_preserved_items(), self, host)
+
+    def on_after_provisioning(
+        self,
+        host: OnlineHostInterface,
+        options: CreateAgentOptions,
+        mngr_ctx: MngrContext,
+    ) -> None:
+        """Adopt an existing conversation so the new agent resumes it."""
+        self.adopt_session(host, options, mngr_ctx)
+
+    def adopt_session(
+        self,
+        host: OnlineHostInterface,
+        options: CreateAgentOptions,
+        mngr_ctx: MngrContext,
+    ) -> None:
+        """Adopt existing OpenHands conversation(s) into this newly provisioned agent.
+
+        Two sources, combined via the shared ``adopt_sessions`` orchestrator:
+
+        - ``--adopt`` (``options.adopt_session``): each value is a conversation id
+          (or an absolute path to a conversation dir), resolved against the user's
+          native store and every live/preserved mngr agent, then copied into this
+          agent's isolated ``conversations`` dir. An unknown id is a hard error.
+        - ``--from <agent>`` (``options.source_agent_state_location``): a clone that
+          copies the source workspace but not its state dir; the source agent's
+          whole conversations tree is transferred in and its latest conversation
+          resumed. A source with no conversation is a warning, not an error.
+
+        The conversation actually resumed — via the pointer file that
+        ``assemble_command``'s prelude reads — is the ``--from`` clone's when given,
+        else the last ``--adopt`` value. With neither set, nothing is adopted
+        (fresh start). No cwd rebinding is needed: OpenHands takes the resumed
+        conversation's working dir from ``OPENHANDS_WORK_DIR`` (injected per-agent).
+        """
+        if not self.agent_config.isolate_state:
+            if options.adopt_session or options.source_agent_state_location is not None:
+                logger.warning(
+                    "openhands: session adoption requires isolate_state=True; ignoring --adopt/--from"
+                )
+            return
+        adopt_sessions(
+            options.adopt_session,
+            options.source_agent_state_location,
+            copy_explicit=lambda arg: self._copy_explicit_conversation(host, arg, mngr_ctx),
+            copy_clone=lambda location: self._copy_cloned_conversation(host, location),
+            resume=lambda conversation_id: self._write_resume_pointer(host, conversation_id),
+        )
+
+    def _agent_conversations_dir(self, host: OnlineHostInterface) -> Path:
+        """This agent's isolated conversations dir *on ``host``*
+        (``<state>/openhands/conversations``)."""
+        return self._host_agent_dir(host) / CONVERSATIONS_RELPATH
+
+    def _copy_explicit_conversation(
+        self, host: OnlineHostInterface, adopt_arg: str, mngr_ctx: MngrContext
+    ) -> str:
+        """Resolve one ``--adopt`` value, copy its conversation dir in, return its id."""
+        conversation_id, source_conversation_dir = _resolve_adopt_conversation(adopt_arg, mngr_ctx)
+        dest = self._agent_conversations_dir(host) / conversation_id
+        host.copy_directory(host, source_conversation_dir, dest)
+        logger.info("Adopted OpenHands conversation {} into agent {}", conversation_id, self.id)
+        return conversation_id
+
+    def _copy_cloned_conversation(
+        self, host: OnlineHostInterface, source_location: HostLocation
+    ) -> str | None:
+        """Transfer a cloned source agent's conversations in; resume its latest one."""
+        copied = transfer_cloned_agent_session_store(
+            host, self._host_agent_dir(host), source_location, Path(CONVERSATIONS_RELPATH)
+        )
+        if not copied:
+            logger.info("openhands: cloned source has no conversations; starting fresh")
+            return None
+        return self._find_latest_conversation_id(host, self._agent_conversations_dir(host))
+
+    def _write_resume_pointer(self, host: OnlineHostInterface, conversation_id: str) -> None:
+        """Record the conversation id ``assemble_command``'s prelude resumes on launch."""
+        pointer = self._host_agent_dir(host) / RESUME_POINTER_FILENAME
+        host.write_text_file(pointer, conversation_id)
+
+    @staticmethod
+    def _find_latest_conversation_id(host: OnlineHostInterface, conversations_dir: Path) -> str | None:
+        """Return the id (dir name) of the most-recently-modified conversation, or None."""
+        result = host.execute_idempotent_command(
+            f"ls -1t {shlex.quote(str(conversations_dir))} 2>/dev/null || true"
+        )
+        for line in result.stdout.splitlines():
+            name = line.strip()
+            if name:
+                return name
+        return None
 
     def modify_env_vars(self, host: OnlineHostInterface, env_vars: dict[str, str]) -> None:
         """Point OpenHands' state dirs at this agent's mngr state dir.
@@ -249,6 +446,97 @@ class OpenHandsAgent(
             return Path(host.host_dir).parent
         except Exception:  # pragma: no cover - defensive
             return Path(os.path.expanduser("~"))
+
+
+# ── session preserve / adopt: module-level helpers ───────────────────────
+
+# The conversations store, addressed relative to the agent state dir (the same
+# relpath used for preserve and for scanning adopt sources).
+_CONVERSATIONS_RELPATH: Path = Path(CONVERSATIONS_RELPATH)
+
+
+def _openhands_preserved_items() -> list[PreservedItem]:
+    """Files to preserve from an OpenHands agent's state dir: its conversations.
+
+    (No transcript items yet — this plugin does not emit a common/raw transcript;
+    when it does, add ``build_transcript_preserved_items("openhands")`` here.)
+    """
+    return [PreservedItem(rel_path=CONVERSATIONS_RELPATH, kind=FileType.DIRECTORY)]
+
+
+def _openhands_items_for_discovered_agent(ref: DiscoveredAgent):
+    """Items to preserve for a discovered (offline) openhands agent, or None to skip."""
+    return flag_gated_items(ref, "preserve_on_destroy", _openhands_preserved_items())
+
+
+def _mngr_conversation_dirs(mngr_ctx: MngrContext) -> list[Path]:
+    """Per-agent OpenHands ``conversations`` dirs across live + preserved local agents."""
+    local_host_dir = Path(mngr_ctx.config.default_host_dir).expanduser()
+    return iter_agent_session_paths(local_host_dir, _CONVERSATIONS_RELPATH)
+
+
+def _resolve_adopt_conversation(adopt_arg: str, mngr_ctx: MngrContext) -> tuple[str, Path]:
+    """Resolve an ``--adopt`` value to a ``(conversation_id, source_conversation_dir)`` pair.
+
+    Accepts either:
+
+    - An absolute path to a conversation directory (its basename is the id).
+    - A bare conversation id, searched across every live and preserved local mngr
+      agent's ``conversations`` store. An id present in more than one store is
+      rejected as ambiguous (pass the absolute path to disambiguate).
+    """
+    candidate = Path(adopt_arg)
+    if candidate.is_absolute():
+        source = candidate.resolve()
+        if not source.is_dir():
+            raise UserInputError(f"Conversation directory not found: {source}")
+        return source.name, source
+
+    matches: list[Path] = []
+    for conversations_dir in dedupe_by_resolved_path(_mngr_conversation_dirs(mngr_ctx)):
+        candidate_dir = conversations_dir / adopt_arg
+        if candidate_dir.is_dir():
+            matches.append(candidate_dir)
+
+    matched = require_unique_match(
+        matches,
+        not_found_message=(
+            f"OpenHands conversation {adopt_arg} not found. Check the id, or pass an absolute "
+            "path to the conversation directory. (Searched every live and preserved mngr "
+            "openhands agent.)"
+        ),
+        ambiguous_message=(
+            f"OpenHands conversation {adopt_arg} found in multiple stores; pass the absolute "
+            "path to the conversation directory to specify which one:"
+        ),
+    )
+    return adopt_arg, matched
+
+
+@hookimpl
+def on_before_create(args: OnBeforeCreateArgs, mngr_ctx: MngrContext) -> OnBeforeCreateArgs | None:
+    """Fail fast on bad ``--adopt`` conversation ids before any host/worktree exists."""
+    run_adopt_session_preflight(
+        args.agent_options.agent_type,
+        args.agent_options.adopt_session,
+        mngr_ctx,
+        OpenHandsAgent,
+        resolve_one=lambda arg: _resolve_adopt_conversation(arg, mngr_ctx),
+    )
+    return None
+
+
+@hookimpl
+def on_before_host_destroy(host: HostInterface, mngr_ctx: MngrContext) -> None:
+    """Preserve openhands conversations off a host's volume before it is destroyed.
+
+    Mirrors ``OpenHandsAgent.on_destroy`` for the offline path, where a host is
+    destroyed without per-agent ``on_destroy`` calls but agent state still lives
+    on the host's persisted volume.
+    """
+    preserve_host_agents_on_destroy(
+        host, mngr_ctx, AgentTypeName("openhands"), _openhands_items_for_discovered_agent
+    )
 
 
 @hookimpl

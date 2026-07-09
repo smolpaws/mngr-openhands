@@ -226,9 +226,19 @@ class OpenHandsAgent(
             if base_cmd:
                 command_override = CommandString(f"{base_cmd} {' '.join(extra)}")
         base = super().assemble_command(host, agent_args, command_override, initial_message)
-        return self._wrap_with_resume_prelude(base)
+        return self._wrap_with_resume_prelude(host, base)
 
-    def _wrap_with_resume_prelude(self, base: CommandString) -> CommandString:
+    def _host_agent_dir(self, host: OnlineHostInterface) -> Path:
+        """The agent's state dir *on ``host``* (which may be remote).
+
+        Resolves against the passed host rather than ``self.host`` so the
+        adopt/preserve/resume paths address files on the host the agent actually
+        runs on. Falls back to ``_get_agent_dir()`` (which resolves against
+        ``self.host.host_dir`` — the same value for the bound agent).
+        """
+        return self._resolve_agent_state_dir(host) or self._get_agent_dir()
+
+    def _wrap_with_resume_prelude(self, host: OnlineHostInterface, base: CommandString) -> CommandString:
         """Append ``--resume <id>`` when an adopted conversation is pending.
 
         ``adopt_session`` runs in ``on_after_provisioning`` — *after*
@@ -242,7 +252,7 @@ class OpenHandsAgent(
         """
         if not self.agent_config.isolate_state:
             return base
-        quoted_pointer = shlex.quote(str(self._get_agent_dir() / RESUME_POINTER_FILENAME))
+        quoted_pointer = shlex.quote(str(self._host_agent_dir(host) / RESUME_POINTER_FILENAME))
         resume_prelude = (
             f'__oh_cid="$(cat {quoted_pointer} 2>/dev/null || true)"; set --; '
             f'if [ -n "$__oh_cid" ]; then set -- {RESUME_FLAG} "$__oh_cid"; fi'
@@ -307,16 +317,17 @@ class OpenHandsAgent(
             resume=lambda conversation_id: self._write_resume_pointer(host, conversation_id),
         )
 
-    def _agent_conversations_dir(self) -> Path:
-        """This agent's isolated conversations dir (``<state>/openhands/conversations``)."""
-        return self._get_agent_dir() / CONVERSATIONS_RELPATH
+    def _agent_conversations_dir(self, host: OnlineHostInterface) -> Path:
+        """This agent's isolated conversations dir *on ``host``*
+        (``<state>/openhands/conversations``)."""
+        return self._host_agent_dir(host) / CONVERSATIONS_RELPATH
 
     def _copy_explicit_conversation(
         self, host: OnlineHostInterface, adopt_arg: str, mngr_ctx: MngrContext
     ) -> str:
         """Resolve one ``--adopt`` value, copy its conversation dir in, return its id."""
         conversation_id, source_conversation_dir = _resolve_adopt_conversation(adopt_arg, mngr_ctx)
-        dest = self._agent_conversations_dir() / conversation_id
+        dest = self._agent_conversations_dir(host) / conversation_id
         host.copy_directory(host, source_conversation_dir, dest)
         logger.info("Adopted OpenHands conversation {} into agent {}", conversation_id, self.id)
         return conversation_id
@@ -326,16 +337,16 @@ class OpenHandsAgent(
     ) -> str | None:
         """Transfer a cloned source agent's conversations in; resume its latest one."""
         copied = transfer_cloned_agent_session_store(
-            host, self._get_agent_dir(), source_location, Path(CONVERSATIONS_RELPATH)
+            host, self._host_agent_dir(host), source_location, Path(CONVERSATIONS_RELPATH)
         )
         if not copied:
             logger.info("openhands: cloned source has no conversations; starting fresh")
             return None
-        return self._find_latest_conversation_id(host, self._agent_conversations_dir())
+        return self._find_latest_conversation_id(host, self._agent_conversations_dir(host))
 
     def _write_resume_pointer(self, host: OnlineHostInterface, conversation_id: str) -> None:
         """Record the conversation id ``assemble_command``'s prelude resumes on launch."""
-        pointer = self._get_agent_dir() / RESUME_POINTER_FILENAME
+        pointer = self._host_agent_dir(host) / RESUME_POINTER_FILENAME
         host.write_text_file(pointer, conversation_id)
 
     @staticmethod

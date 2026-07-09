@@ -264,13 +264,18 @@ def _adopt_agent(monkeypatch, state_dir: Path, **cfg):
     agent = plugin.OpenHandsAgent.model_construct(
         agent_type="openhands", agent_config=cfg_obj, id="agent-test"
     )
+    # _host_agent_dir resolves the state dir on the host; pin it to our tmp dir
+    # (both the host-resolve and the local fallback) so the test drives our path.
+    monkeypatch.setattr(type(agent), "_resolve_agent_state_dir", lambda self, host: state_dir)
     monkeypatch.setattr(type(agent), "_get_agent_dir", lambda self: state_dir)
     return agent
 
 
 def test_resume_prelude_wraps_command_when_isolated(monkeypatch, tmp_path):
     agent = _adopt_agent(monkeypatch, tmp_path / "st")
-    wrapped = str(agent._wrap_with_resume_prelude(plugin.CommandString("openhands --always-approve")))
+    wrapped = str(
+        agent._wrap_with_resume_prelude(_AdoptHost(), plugin.CommandString("openhands --always-approve"))
+    )
     assert "--resume" in wrapped
     assert "openhands --always-approve" in wrapped
     assert str(tmp_path / "st" / plugin.RESUME_POINTER_FILENAME) in wrapped
@@ -279,7 +284,7 @@ def test_resume_prelude_wraps_command_when_isolated(monkeypatch, tmp_path):
 def test_resume_prelude_is_noop_when_not_isolated(monkeypatch, tmp_path):
     agent = _adopt_agent(monkeypatch, tmp_path / "st", isolate_state=False)
     cmd = plugin.CommandString("openhands")
-    assert str(agent._wrap_with_resume_prelude(cmd)) == "openhands"
+    assert str(agent._wrap_with_resume_prelude(_AdoptHost(), cmd)) == "openhands"
 
 
 def test_resolve_adopt_conversation_absolute_path(tmp_path):

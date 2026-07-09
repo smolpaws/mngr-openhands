@@ -1,8 +1,8 @@
 # mngr-openhands
 
 An [mngr](https://github.com/imbue-ai/mngr) plugin that registers **OpenHands** as
-a first-class agent type, so you can create, list, and orchestrate OpenHands
-agents alongside Claude Code, Codex, and OpenCode.
+an agent type, so you can create, list, and orchestrate OpenHands agents
+alongside Claude Code, Codex, and OpenCode.
 
 ```bash
 mngr create my-task openhands
@@ -72,9 +72,10 @@ each toggleable via config:
   its own git worktree, and persists its conversation under the isolated
   per-agent state dir (not `~/.openhands`).
 
-## Roadmap (toward parity with mngr_claude / mngr_opencode)
+## Roadmap
 
-Remaining to make OpenHands a full first-class citizen:
+Deeper integrations mngr's built-in plugins (`mngr_codex` / `mngr_claude`) have,
+that could come next:
 
 1. **Common transcript** — convert OpenHands' event stream into mngr's transcript
    format so `mngr transcript` works (OpenHands has structured events / `--json`
